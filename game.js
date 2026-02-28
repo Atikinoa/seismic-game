@@ -31,24 +31,42 @@ const PW       = 58;     // player sprite width
 const PH       = 76;     // player sprite height
 const GY       = H - 58; // ground reference Y
 
+// ── Leaderboard ───────────────────────────────────────────────────────────────
+const LB_KEY = 'seismicLeaderboard';
+let lb = loadLB();
+
+function loadLB() {
+  try {
+    const d = JSON.parse(localStorage.getItem(LB_KEY) || '[]');
+    return Array.isArray(d) ? d : [];
+  } catch (_) { return []; }
+}
+
+function saveLB() {
+  localStorage.setItem(LB_KEY, JSON.stringify(lb));
+}
+
+function addToLB(name, s) {
+  lb.push({ name: (name || 'Player').slice(0, 16), score: s });
+  lb.sort((a, b) => b.score - a.score);
+  lb = lb.slice(0, 5);
+  saveLB();
+}
+
 // ── Game state ────────────────────────────────────────────────────────────────
-let gs       = 'loading'; // loading | start | playing | gameover
-let score    = 0;
-let best     = 0;
-let lives    = 3;
-let camX     = 0;         // world X at left edge of screen
-let genX     = 0;         // rightmost generated platform right edge (world X)
-let spd      = BASE_SPD;  // current scroll speed
-let flashA   = 0;         // death flash alpha 0..1
-let shakePow = 0;         // screen shake intensity
+let gs         = 'loading'; // loading | start | nickname | playing | gameover
+let score      = 0;
+let best       = 0;
+let lives      = 3;
+let camX       = 0;         // world X at left edge of screen
+let genX       = 0;         // rightmost generated platform right edge (world X)
+let spd        = BASE_SPD;  // current scroll speed
+let flashA     = 0;         // death flash alpha 0..1
+let shakePow   = 0;         // screen shake intensity
+let playerName = '';        // name being typed on nickname screen
+let nickInput  = '';        // confirmed nickname for current run
 
 // ── Player object ─────────────────────────────────────────────────────────────
-// xo  = horizontal screen offset from PX
-// y   = vertical screen position
-// vy  = vertical velocity
-// ground = is on ground
-// inv = invincibility frames remaining
-// bob = bob animation timer
 const P = { xo: 0, y: 0, vy: 0, ground: false, inv: 0, bob: 0 };
 
 function spawnAt(plat) {
@@ -166,12 +184,22 @@ const K = { L: false, R: false, J: false };
 
 document.addEventListener('keydown', e => {
   const c = e.code;
+
+  // Nickname screen: capture typing, Enter to confirm
+  if (gs === 'nickname') {
+    e.preventDefault();
+    if (c === 'Enter') { confirmNickname(); return; }
+    if (c === 'Backspace') { playerName = playerName.slice(0, -1); return; }
+    if (e.key.length === 1 && playerName.length < 16) playerName += e.key;
+    return;
+  }
+
   if (c === 'ArrowLeft'  || c === 'KeyA') { K.L = true;  e.preventDefault(); }
   if (c === 'ArrowRight' || c === 'KeyD') { K.R = true;  e.preventDefault(); }
   if (c === 'Space' || c === 'ArrowUp' || c === 'KeyW') {
     K.J = true;
     e.preventDefault();
-    if (gs === 'start' || gs === 'gameover') startGame();
+    if (gs === 'start' || gs === 'gameover') openNickname();
   }
 });
 
@@ -183,19 +211,27 @@ document.addEventListener('keyup', e => {
 });
 
 C.addEventListener('click', e => {
-  if (gs === 'start') { startGame(); return; }
+  if (gs === 'start')    { openNickname(); return; }
+  if (gs === 'nickname') { confirmNickname(); return; }
   if (gs === 'gameover') {
-    // Check restart button hit area
+    // Check restart button hit area (matches drawGameOver button position)
     const rect = C.getBoundingClientRect();
     const mx = (e.clientX - rect.left) * (W / rect.width);
     const my = (e.clientY - rect.top)  * (H / rect.height);
     const bx = W / 2 - 105;
-    const by = H / 2 - 148 + 175;
-    if (mx > bx && mx < bx + 210 && my > by && my < by + 50) startGame();
+    const by = H / 2 - 190 + 322; // cy + 322
+    if (mx > bx && mx < bx + 210 && my > by && my < by + 46) openNickname();
   }
 });
 
-function startGame() {
+function openNickname() {
+  // Keep last typed name pre-filled for convenience
+  gs = 'nickname';
+}
+
+function confirmNickname() {
+  if (playerName.trim() === '') playerName = 'Player';
+  nickInput = playerName.trim();
   K.J   = false; // prevent immediate jump on game start
   score = 0;
   lives = 3;
@@ -217,7 +253,7 @@ function update() {
   else if (K.R) P.xo = Math.min(P.xo + 0.6,  60);
   else          P.xo *= 0.88;
 
-  // Jump — only from ground, no restriction during invincibility
+  // Jump — only from ground
   if (K.J && P.ground) { P.vy = JUMP; P.ground = false; }
 
   // Physics
@@ -306,29 +342,23 @@ function die() {
   if (lives <= 0) {
     lives = 0;
     if (score > best) best = score;
+    addToLB(nickInput, score);
     gs = 'gameover';
     return;
   }
 
-  // Find the platform closest to screen center to respawn on
-  let pick = null;
-  let bd   = Infinity;
-  for (const pl of plats) {
-    const sx = pl.wx - camX;
-    if (sx + pl.w < 0 || sx > W) continue;
-    const d = Math.abs(sx + pl.w / 2 - W / 2);
-    if (d < bd) { bd = d; pick = pl; }
-  }
+  // Insert a guaranteed wide respawn platform at the current position
+  // so the player has plenty of runway after losing a life.
+  const respWX = camX + PX - 80; // world X: 80px to the left of the player
+  const respY  = GY;             // at ground level
+  const respW  = 460;            // wide enough to react
+  plats.push({ wx: respWX, y: respY, w: respW, h: 48 });
+  if (respWX + respW > genX) genX = respWX + respW;
 
-  // Reposition camera so chosen platform sits under the player
-  if (pick) {
-    camX = pick.wx - PX;
-    P.y  = pick.y - PH - 2;
-  } else {
-    P.y = GY - PH;
-  }
+  // Place player just above the platform; vy=1 triggers collision on frame 1
+  P.y      = respY - PH;
+  P.vy     = 1;
   P.xo     = 0;
-  P.vy     = 0;
   P.bob    = 0;
   P.ground = false;
   P.inv    = 150; // ~2.5 s of invincibility
@@ -497,8 +527,16 @@ function drawPlayer() {
     ctx.fill();
   }
 
-  // 'screen' composite removes the black JPG background cleanly
-  drawImg(I_SIDE, dx, dy, dw, dh, true);
+  // Draw sprite flipped horizontally so the character faces right.
+  // Translate origin to the right edge of the sprite, then scale(-1,1)
+  // so the image is mirrored and still occupies [dx, dx+dw] on screen.
+  if (!I_SIDE.complete || !I_SIDE.naturalWidth) return;
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.translate(dx + dw, dy);
+  ctx.scale(-1, 1);
+  ctx.drawImage(I_SIDE, 0, 0, dw, dh);
+  ctx.restore();
 }
 
 // ── Particles ─────────────────────────────────────────────────────────────────
@@ -555,6 +593,72 @@ function drawHUD() {
   ctx.textAlign = 'left';
 }
 
+// ── Shared leaderboard panel ──────────────────────────────────────────────────
+function drawLBPanel(x, y, w, h) {
+  // Panel background
+  ctx.fillStyle = 'rgba(10,4,28,.95)';
+  rrect(x, y, w, h, 12); ctx.fill();
+  ctx.strokeStyle = '#6d28d9';
+  ctx.lineWidth = 1.5;
+  rrect(x, y, w, h, 12); ctx.stroke();
+
+  // Header
+  ctx.fillStyle = '#a855f7';
+  ctx.font = 'bold 13px "Segoe UI",Verdana,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('TOP SCORES', x + w / 2, y + 22);
+
+  // Separator
+  ctx.strokeStyle = 'rgba(109,40,217,.4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x + 12, y + 30);
+  ctx.lineTo(x + w - 12, y + 30);
+  ctx.stroke();
+
+  if (lb.length === 0) {
+    ctx.fillStyle = 'rgba(168,85,247,.38)';
+    ctx.font = '12px "Segoe UI",Verdana,sans-serif';
+    ctx.fillText('No scores yet', x + w / 2, y + 52);
+    ctx.textAlign = 'left';
+    return;
+  }
+
+  const rankColors = ['#fbbf24', '#94a3b8', '#a16207', '#7c3aed', '#7c3aed'];
+  const rowH = Math.min(22, (h - 40) / 5);
+
+  for (let i = 0; i < Math.min(lb.length, 5); i++) {
+    const entry = lb[i];
+    const ey = y + 46 + i * rowH;
+
+    // Subtle row highlight for top 3
+    if (i < 3) {
+      const rowTints = ['rgba(250,200,0,.06)', 'rgba(180,180,180,.04)', 'rgba(160,100,0,.04)'];
+      ctx.fillStyle = rowTints[i];
+      ctx.fillRect(x + 8, ey - 14, w - 16, rowH);
+    }
+
+    // Rank
+    ctx.fillStyle = rankColors[i];
+    ctx.font = 'bold 12px "Segoe UI",Verdana,sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`#${i + 1}`, x + 12, ey);
+
+    // Name (truncated at 12 chars)
+    ctx.fillStyle = '#ddd0ff';
+    ctx.font = '12px "Segoe UI",Verdana,sans-serif';
+    const nameStr = entry.name.length > 12 ? entry.name.slice(0, 12) + '\u2026' : entry.name;
+    ctx.fillText(nameStr, x + 38, ey);
+
+    // Score
+    ctx.fillStyle = '#f0abfc';
+    ctx.font = 'bold 12px "Segoe UI",Verdana,sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(entry.score, x + w - 12, ey);
+  }
+  ctx.textAlign = 'left';
+}
+
 // ── Screen: Loading ───────────────────────────────────────────────────────────
 function drawLoading() {
   ctx.fillStyle = '#030208';
@@ -572,9 +676,10 @@ function drawStart() {
   ctx.fillStyle = 'rgba(3,1,10,.82)';
   ctx.fillRect(0, 0, W, H);
 
-  const cw = 492, ch = 348;
-  const cx = W / 2 - cw / 2;
-  const cy = H / 2 - ch / 2;
+  // Main panel (left side)
+  const cw = 460, ch = 360;
+  const cx = 15;
+  const cy = (H - ch) / 2; // 45
 
   ctx.fillStyle = 'rgba(10,5,26,.97)';
   rrect(cx, cy, cw, ch, 18); ctx.fill();
@@ -587,22 +692,22 @@ function drawStart() {
   ctx.shadowColor = '#a855f7';
   ctx.shadowBlur  = 22;
   ctx.fillStyle   = '#e879f9';
-  ctx.font = 'bold 44px "Segoe UI",Verdana,sans-serif';
+  ctx.font = 'bold 40px "Segoe UI",Verdana,sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('SEISMIC RUN', W / 2, cy + 58);
+  ctx.fillText('SEISMIC RUN', cx + cw / 2, cy + 50);
   ctx.restore();
 
-  // Mascot front view — screen blend removes black background
-  drawImg(I_FRONT, W / 2 - 62, cy + 68, 124, 136, true);
+  // Mascot front view
+  drawImg(I_FRONT, cx + cw / 2 - 52, cy + 62, 104, 114, true);
 
   // Instructions
   ctx.fillStyle = '#c084fc';
-  ctx.font = '16px "Segoe UI",Verdana,sans-serif';
+  ctx.font = '15px "Segoe UI",Verdana,sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('Run · Jump · Collect Crystals · Survive!', W / 2, cy + 232);
+  ctx.fillText('Run · Jump · Collect Crystals · Survive!', cx + cw / 2, cy + 200);
   ctx.fillStyle = 'rgba(168,85,247,.7)';
-  ctx.font = '14px "Segoe UI",Verdana,sans-serif';
-  ctx.fillText('SPACE / ↑  to jump      ← → / A D  to nudge', W / 2, cy + 255);
+  ctx.font = '13px "Segoe UI",Verdana,sans-serif';
+  ctx.fillText('SPACE / \u2191  to jump      \u2190 \u2192 / A D  to nudge', cx + cw / 2, cy + 220);
 
   // Blinking call-to-action
   const bl = (Date.now() / 560 | 0) % 2;
@@ -610,9 +715,79 @@ function drawStart() {
   ctx.shadowColor = bl ? '#e879f9' : 'transparent';
   ctx.shadowBlur  = bl ? 14 : 0;
   ctx.fillStyle   = bl ? '#e879f9' : '#9333ea';
-  ctx.font = 'bold 20px "Segoe UI",Verdana,sans-serif';
-  ctx.fillText('▶  PRESS SPACE OR CLICK TO START', W / 2, cy + 307);
+  ctx.font = 'bold 17px "Segoe UI",Verdana,sans-serif';
+  ctx.fillText('\u25b6  PRESS SPACE OR CLICK TO START', cx + cw / 2, cy + 328);
   ctx.restore();
+
+  ctx.textAlign = 'left';
+
+  // Leaderboard panel (right side)
+  const lx = cx + cw + 15; // 490
+  const lw = W - lx - 15;  // 295
+  drawLBPanel(lx, cy, lw, ch);
+}
+
+// ── Screen: Nickname ──────────────────────────────────────────────────────────
+function drawNickname() {
+  ctx.fillStyle = 'rgba(3,1,10,.82)';
+  ctx.fillRect(0, 0, W, H);
+
+  const cw = 420, ch = 220;
+  const cx = W / 2 - cw / 2;
+  const cy = H / 2 - ch / 2;
+
+  ctx.fillStyle = 'rgba(10,5,26,.97)';
+  rrect(cx, cy, cw, ch, 18); ctx.fill();
+  ctx.strokeStyle = '#7c3aed';
+  ctx.lineWidth = 2;
+  rrect(cx, cy, cw, ch, 18); ctx.stroke();
+
+  // Title
+  ctx.save();
+  ctx.shadowColor = '#a855f7';
+  ctx.shadowBlur  = 18;
+  ctx.fillStyle   = '#e879f9';
+  ctx.font = 'bold 26px "Segoe UI",Verdana,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('ENTER YOUR NAME', W / 2, cy + 50);
+  ctx.restore();
+
+  // Input box
+  const ibx = cx + 28;
+  const iby = cy + 72;
+  const ibw = cw - 56;
+  const ibh = 44;
+
+  ctx.fillStyle = 'rgba(30,10,60,.9)';
+  rrect(ibx, iby, ibw, ibh, 8); ctx.fill();
+  ctx.strokeStyle = '#9333ea';
+  ctx.lineWidth = 1.5;
+  rrect(ibx, iby, ibw, ibh, 8); ctx.stroke();
+
+  // Typed name with blinking cursor
+  const cursor = (Date.now() / 500 | 0) % 2 ? '|' : ' ';
+  ctx.fillStyle = '#f0e8ff';
+  ctx.font = 'bold 20px "Segoe UI",Verdana,sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText((playerName || '') + cursor, ibx + 12, iby + 29);
+
+  // Hint
+  ctx.fillStyle = 'rgba(168,85,247,.6)';
+  ctx.font = '12px "Segoe UI",Verdana,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Type your nickname  \u00b7  Enter or click to confirm', W / 2, cy + 155);
+
+  // Confirm button
+  const btnx = W / 2 - 90;
+  const btny = cy + 170;
+  ctx.fillStyle = '#6d28d9';
+  rrect(btnx, btny, 180, 36, 8); ctx.fill();
+  ctx.strokeStyle = '#e879f9';
+  ctx.lineWidth = 1.5;
+  rrect(btnx, btny, 180, 36, 8); ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px "Segoe UI",Verdana,sans-serif';
+  ctx.fillText('\u25b6  CONFIRM', W / 2, btny + 24);
 
   ctx.textAlign = 'left';
 }
@@ -622,7 +797,7 @@ function drawGameOver() {
   ctx.fillStyle = 'rgba(3,1,10,.88)';
   ctx.fillRect(0, 0, W, H);
 
-  const cw = 380, ch = 295;
+  const cw = 480, ch = 380;
   const cx = W / 2 - cw / 2;
   const cy = H / 2 - ch / 2;
 
@@ -644,28 +819,32 @@ function drawGameOver() {
 
   // Score
   ctx.fillStyle = '#f0abfc';
-  ctx.font = 'bold 26px "Segoe UI",Verdana,sans-serif';
+  ctx.font = 'bold 24px "Segoe UI",Verdana,sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('Crystals: ' + score, W / 2, cy + 120);
+  ctx.fillText('Crystals: ' + score, W / 2, cy + 106);
 
   // Best score
   if (best > 0) {
     ctx.fillStyle = '#a78bfa';
-    ctx.font = '17px "Segoe UI",Verdana,sans-serif';
-    ctx.fillText('Best: ' + best, W / 2, cy + 150);
+    ctx.font = '16px "Segoe UI",Verdana,sans-serif';
+    ctx.fillText('Best: ' + best, W / 2, cy + 130);
   }
+
+  // Leaderboard sub-panel
+  drawLBPanel(cx + 20, cy + 148, cw - 40, 162);
 
   // Restart button
   const bx = W / 2 - 105;
-  const by = cy + 175;
+  const by = cy + 322;
   ctx.fillStyle = '#6d28d9';
-  rrect(bx, by, 210, 50, 10); ctx.fill();
+  rrect(bx, by, 210, 46, 10); ctx.fill();
   ctx.strokeStyle = '#e879f9';
   ctx.lineWidth = 2;
-  rrect(bx, by, 210, 50, 10); ctx.stroke();
+  rrect(bx, by, 210, 46, 10); ctx.stroke();
   ctx.fillStyle = '#fff';
-  ctx.font = 'bold 22px "Segoe UI",Verdana,sans-serif';
-  ctx.fillText('▶  PLAY AGAIN', W / 2, by + 33);
+  ctx.font = 'bold 20px "Segoe UI",Verdana,sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('\u25b6  PLAY AGAIN', W / 2, by + 30);
 
   ctx.textAlign = 'left';
 }
@@ -674,8 +853,8 @@ function drawGameOver() {
 function loop() {
   ctx.save();
 
-  // Screen shake offset
-  if (shakePow > 1) {
+  // Screen shake offset — only during active gameplay
+  if (gs === 'playing' && shakePow > 1) {
     ctx.translate(
       (Math.random() - 0.5) * shakePow * 0.6,
       (Math.random() - 0.5) * shakePow * 0.4
@@ -701,6 +880,7 @@ function loop() {
 
   if (gs === 'loading')  drawLoading();
   if (gs === 'start')    drawStart();
+  if (gs === 'nickname') drawNickname();
   if (gs === 'gameover') drawGameOver();
 
   ctx.restore();
